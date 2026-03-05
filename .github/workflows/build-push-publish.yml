@@ -1,27 +1,36 @@
-# .github/workflows/build-scan-publish.yml
 name: Build, Scan, and Publish Docker Image
 
 on:
-  # Run on pushes to main/master, which will build, scan, AND push the image
   push:
     branches:
       - main
       - master
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
 permissions:
-  contents: read      # to checkout the repo
-  packages: write     # to publish to GitHub Container Registry
+  contents: read
+  packages: write
 
 jobs:
   build-scan-and-push:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
+      # 1. Setup Java Environment
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # 2. Build the JAR file (Fixes the "target/not found" error)
+      - name: Build with Maven
+        run: mvn clean package -DskipTests
+
+      # 3. Log in to GitHub Container Registry
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v2
         with:
@@ -29,34 +38,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 4. Build the Docker Image locally (DO NOT PUSH YET)
       - name: Build Docker image
-        id: build # Add an ID to this step to reference it later if needed
         uses: docker/build-push-action@v3
         with:
           context: .
           file: ./Dockerfile
-          # Only push the image on a 'push' event to the main/master branch.
-          # For pull requests, this will be 'false', so it only builds the image locally.
-          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+          push: false  # Build locally so we can scan it first
+          load: true   # This loads the image into the local Docker daemon for scanning
           tags: |
             ghcr.io/m0n7i-labs/vulnerable-java:latest
             ghcr.io/m0n7i-labs/vulnerable-java:${{ github.sha }}
 
+      # 5. Wiz CLI Setup and Scan
       - name: Download Wiz CLI
         run: curl -o wizcli https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64 && chmod +x wizcli
 
       - name: Authenticate to Wiz
-        # Ensure you have WIZ_CLIENT_ID and WIZ_CLIENT_SECRET configured in your repository secrets
         run: ./wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
 
       - name: Run wiz-cli docker image scan
-        # Scans the 'latest' tag of the image that was just built locally
-        # If the scan finds vulnerabilities that violate the policy, it will fail this step and the entire workflow
-        run: ./wizcli docker scan --image ghcr.io/m0n7i-labs/vulnerable-java:latest --policy "Default vulnerabilities policy"
-
-      - name: Fetch digest of Docker image for Graph enrichment
-        # This step only runs if the scan above succeeds
-        run: ./wizcli docker tag --image ghcr.io/m0n7i-labs/vulnerable-java:latest
+        # This will fail the build if vulnerabilities are found
+        run: ./wizcli docker scan --image
